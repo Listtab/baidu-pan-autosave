@@ -1,0 +1,6 @@
+# 仅存在于本机，不纳入版本库
+references/personal-defaults.md
+
+# Python 运行产物
+__pycache__/
+*.pyc
