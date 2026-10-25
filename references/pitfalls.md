@@ -1,62 +1,58 @@
-# 已知陷阱与排查手册
+# 踩坑记录
 
-本文件记录构建过程中实测遇到的全部问题。修改脚本或排查异常前先读这里，可避免重复踩坑。
+配这套东西的过程中撞上的问题，大致按遇到的顺序写。改脚本或排查异常之前翻一下，能省不少时间。
 
----
+## Git Bash 会把以 / 开头的参数当成路径
 
-## 一、MSYS / Git Bash 路径改写
+现象很迷惑：百度返回 `error_code: 31062, message: 文件名非法`，而报错里的路径显示成 `/C:` 开头。
 
-**症状**：百度返回 `error_code: 31062, message: 文件名非法`；脚本报错里的路径显示为 `/C:` 开头；日志出现警告「保存目录不以 / 开头」。
-
-**原因**：Git Bash（MSYS2）会把以 `/` 开头的命令行参数自动转换成 Windows 路径。执行
+原因是 MSYS2 的参数转换。执行下面这句的时候，
 
 ```bash
 gh secret set SAVE_DIR --body "/示例文件夹"
 ```
 
-时，实际传给 `gh` 的值变成 `C:/Program Files/Git/示例文件夹`。
+实际传给 `gh` 的值已经变成 `C:/Program Files/Git/示例文件夹`。Windows 路径被当成网盘路径发给了百度，自然不合法。
 
-**修复**（任选其一）：
+三种解法，任选：
 
 ```bash
+# 关掉本次转换
 MSYS_NO_PATHCONV=1 gh secret set SAVE_DIR --body "/示例文件夹"
-# 或：值走 stdin，不经过命令行参数
-printf '%s' "/示例文件夹" > /tmp/v.txt && gh secret set SAVE_DIR --repo o/r < /tmp/v.txt
+
+# 或者让值走 stdin，不经过命令行参数
+printf '%s' "/示例文件夹" > /tmp/v.txt
+gh secret set SAVE_DIR --repo owner/repo < /tmp/v.txt
 ```
 
-本技能脚本用 Python 的 `subprocess` + `input=` 传值，不经 shell，因此天然免疫。**只有手工用 bash 操作时才会踩到。**
+本技能的脚本用 `subprocess` 加 `input=` 传值，不经过 shell，所以不受影响。只有手工在 bash 里敲命令时才会踩到。
 
-同理，PowerShell 会把 URL 里的 `%2F` 误判为环境变量语法而拦截，打开含百分号编码的 URL 时改用其他方式。
+## gh api 的端点参数也中招
 
-**同一个坑的第二种形态**：`gh api` 的端点参数也中招。
+同一个转换，换了个地方出现：
 
 ```bash
-gh api /user              # 报错：invalid API endpoint "C:/Program Files/.../user"
-gh api user               # 正确，去掉前导斜杠
-gh api /repos/o/r/...     # 同样会坏
+gh api /user        # invalid API endpoint "C:/Program Files/.../user"
+gh api user         # 正确，去掉前导斜杠
 ```
 
-规律：**任何以 `/` 开头的命令行参数**在 Git Bash 下都有风险。写脚本时优先考虑这条路会不会经过 shell。
+`gh api` 的报错信息本身会提示这件事，但第一次见容易看不懂。凡是以 `/` 开头的命令行参数，在 Git Bash 下都有这个风险。
 
----
+顺带一提，PowerShell 有另一套毛病：URL 里的 `%2F` 会被当成环境变量语法，直接拦截命令，跟 MSYS 无关但同样烦人。
 
-## 二、CI 运行时版本不匹配
+## 工作流里的 Python 版本和依赖要求打架
 
-**症状**：Actions 在「Install dependencies」步骤失败：
+CI 在 Install dependencies 这一步就失败：
 
 ```
 ERROR: Could not find a version that satisfies the requirement requests==2.33.0
 ```
 
-**原因**：上游 `requirements.txt` 锁定 `requests==2.33.0`（要求 Python ≥3.10），但 `.github/workflows/baidu-transfer.yml` 写死 `python-version: '3.9'`。属上游仓库自身缺陷，非用户配置问题。
+`requirements.txt` 要 `requests==2.33.0`，这版本要求 Python 3.10 以上，而 `.github/workflows/baidu-transfer.yml` 里 `python-version` 写的是 `'3.9'`。上游自己的两处配置矛盾，跟使用者无关。
 
-**修复**：把工作流里的 `python-version` 改为 `'3.12'`（或任何 ≥3.10 的版本）。
+改工作流里的版本号到 `3.12` 即可。
 
----
-
-## 三、setuptools 缺失
-
-**症状**：依赖装完后，在「Run transfer task」步骤失败：
+## 改完版本，编译又挂了
 
 ```
 File ".../vendor/BaiduPCS-Py/build.py", line 3, in <module>
@@ -64,118 +60,140 @@ File ".../vendor/BaiduPCS-Py/build.py", line 3, in <module>
 ModuleNotFoundError: No module named 'setuptools'
 ```
 
-**原因**：Python 3.12 起 `ensurepip` 不再自带 setuptools，而 `vendor/BaiduPCS-Py` 的 Cython 扩展通过 `setup.py` 编译。
+Python 3.12 起 `ensurepip` 不再附带 setuptools，而 `vendor/BaiduPCS-Py` 的 Cython 扩展还是走 `setup.py` 构建。
 
-**修复**：在 `requirements.txt` 追加 `setuptools>=68`。
+在 `requirements.txt` 末尾加 `setuptools>=68`。
 
-> 这也是为什么单纯把 Python 从 3.9 提到 3.12 不够，两个问题必须一起解决。
+这两件事必须一起解决。只改 Python 版本会让问题从"装不上依赖"变成"编译失败"，看起来像换了个新问题，其实是同一个链条上的下一步。
 
----
+## Fork 出来的工作流要先手动注册
 
-## 四、Fork 仓库的工作流注册
+`gh workflow list` 没有任何输出，`gh workflow enable <文件名>` 返回
 
-**症状**：`gh workflow list` 无输出；`gh workflow enable <file>` 返回 `HTTP 404: workflow not found`；但 `gh api repos/{o}/{r}/contents/.github/workflows` 能看到文件确实存在。
-
-**原因**：GitHub 对 Fork 仓库默认不注册 Actions 工作流，这是安全策略（防止 Fork 后立即消耗额度）。API 无法完成注册。
-
-**处理**：
-
-1. 浏览器打开 `https://github.com/<owner>/<repo>/actions`
-2. 点击横幅 **「I understand my workflows, go ahead and enable them」**
-3. 之后 `gh workflow list --all` 会显示，状态可能是 `disabled_fork`
-4. 用 API 激活：`gh api -X PUT repos/{o}/{r}/actions/workflows/{id}/enable`（按 **ID** 而非文件名，`gh workflow enable <name>` 中文环境下可能匹配失败）
-
-**仍无法绕过**：调度定时任务在仓库 **60 天无活动**后会被 GitHub 自动禁用，需重新启用或手动跑一次保活。
-
----
-
-## 五、GitHub 连接器（MCP）的能力边界
-
-实测结论，避免重复尝试：
-
-- `fork_repository` 返回 `403 Resource not accessible by integration` —— MCP 连接器以 GitHub App 身份运行，无「在用户账号下创建仓库」权限
-- MCP 没有写入 Actions Secrets 的工具
-- 因此 **Fork 与 Secrets 必须用 `gh` CLI 或 PAT**
-
-`gh auth login --web` 的 device flow 可用，但 GitHub 会要求 sudo 模式二次验证（密码/通行码/2FA），该步骤必须由账号本人完成，不可代劳。
-
----
-
-## 六、Cookie 自动化：三条路全部封死
-
-浏览器 Cookie 值前缀 `v20`，属 **App-Bound Encryption**（Chrome 127+ / Edge 同期引入）。实测：
-
-| 尝试 | 结果 |
-|---|---|
-| 读 Edge `Network/Cookies` 并用 DPAPI 解 `Local State` 密钥 | 检测到 `v20`，AES-GCM 解不开，DPAPI 不适用 |
-| 对真实默认配置目录开 `--remote-debugging-port` | Chromium 156 起静默禁用（仅允许非默认 user-data-dir） |
-| 把 User Data 复制到临时目录再开调试端口 | 端口可用，但 ABE 密钥绑定配置路径，**原有 Cookie 全部被丢弃**，只剩新生成的 msn/bing |
-
-`Storage.getCookies` 只返回未受 ABE 保护的少数 Cookie。
-
-**结论**：只能人工从 DevTools 复制。不要在这条路上再花时间。
-
-**附注**：`document.cookie` 也读不到，因为 `BDUSS`/`STOKEN` 是 HttpOnly。
-
----
-
-## 七、SAVE_DIR 语义
-
-`SAVE_DIR` 是**父目录**。分享为单文件夹时，落点 = `SAVE_DIR/<分享文件夹名>`。
-
-写成 `/示例文件夹` 会产生 `/示例文件夹/示例文件夹` 嵌套重复，白占一份空间。
-之后即使改回 `/`，嵌套目录也不会自动消失，需用户在网盘里手动删除。
-
-**判断是否踩坑**：日志出现「尝试整目录直接转存」并成功，且此前目标目录已存在，即为嵌套。
-
----
-
-## 八、错误码速查
-
-| 错误 | 含义 | 处理 |
-|---|---|---|
-| `31062 文件名非法` | 路径含非法字符，或路径被改写（见第一节） | 检查 `SAVE_DIR` 实际值 |
-| `-65` | 触发百度风控限频 | 停跑数小时，勿缩短周期 |
-| 未登录 / 登录态失效 | Cookie 过期 | 重取 `BDUSS`+`STOKEN` |
-| 创建目录失败: 文件名非法 | 同上 31062 | 同上 |
-
----
-
-## 九、Secret 机制
-
-- Secret **只写不可读**，保存后任何人都无法查看原值，只能覆盖
-- 多行 Secret（如 `SHARE_URLS`）必须由用户本地留一份原始清单，否则改动时容易丢链接
-- 日志脱敏是子串级的：`SHARE_URLS` 的值中的片段也会被打码，日志里出现 `【1***1】` 属正常
-
----
-
-## 十、定时任务
-
-- cron 使用 **UTC**，北京时间需减 8 小时
-- 整点（`:00`）最拥挤，建议用 `:17`、`:43` 等错峰分钟，否则可能延迟十几分钟
-- 频率不要低于每 6 小时一次，否则容易触发 `-65`
-
----
-
-## 十一、同步上游会覆盖本地修改
-
-本仓库是 Fork，且 master 上有三类本地提交：CI 修复、定时调整、`skills/` 目录。
-
-```bash
-gh repo sync --force   # ❌ 把 master 强制指向上游，以上修改全部丢失
-gh repo sync           # ✅ 非强制，无法快速前进时会拒绝而不是覆盖
+```
+HTTP 404: workflow not found on the default branch
 ```
 
-需要长期维护本地改动时，更稳的做法是同步前先建备份分支，或把改动挪到独立分支日常使用。
+但文件明明在。`gh api repos/{o}/{r}/contents/.github/workflows` 能看到 `baidu-transfer.yml` 和 `test-on-push.yml`。
 
----
+原因是 GitHub 对 Fork 仓库默认不注册工作流，防止有人 Fork 完立刻刷 Actions 额度。这一步 API 做不到。
 
-## 十二、GitHub 通知设置无法通过 API 查询或修改
+处理办法是打开 `https://github.com/<owner>/<repo>/actions`，点横幅上的确认按钮，之后工作流才会出现在列表里，状态可能是 `disabled_fork`。这时候才能用 API 激活：
 
-- `GET /user/notification_settings` 不存在，返回 404
-- 公开资料里的 `email` 字段可能为 `null`（用户隐藏了邮箱）
-- 读取私有邮箱列表需要 `user` scope，最小权限配置下通常不具备
-- 因此「还会不会发邮件」只能看网页：`Settings → Notifications → System → Actions`
+```bash
+gh api -X PUT repos/{owner}/{repo}/actions/workflows/{id}/enable
+```
 
-**实证判断法**：GitHub 只在工作流**失败**时通知触发者。可以查 `gh run list` 里是否有结论为
-`failure` 的运行记录；若有，询问用户当时是否收到过标题类似 `Run failed` 的邮件——没收到即说明通知已关闭。
+注意按 ID 启用，不要按名字。中文界面下 `gh workflow enable "Baidu Transfer Task"` 会匹配失败，报"找不到名为 xxx 的工作流"。
+
+## 别用 MCP 连接器做这些事
+
+试过，都不行，记下来免得后面又想走这条路：
+
+`fork_repository` 返回 `403 Resource not accessible by integration`，因为 MCP 连接器是以 GitHub App 身份运行的，没有"在用户账号下创建仓库"的权限。MCP 也没有写 Actions Secrets 的工具。
+
+所以建 Fork 和写 Secret 必须用 `gh` CLI 或者自己的 PAT。
+
+另外 `gh auth login --web` 的 device flow 能跑，但 GitHub 会要求 sudo 模式二次验证，输密码或通行密钥。这一步只能账号本人做，代不了。
+
+## Cookie 三条自动化路线全封死
+
+值带 `v20` 前缀，是 Chrome 127 / Edge 同期引入的应用绑定加密。
+
+试过的三条路和结果：
+
+用 DPAPI 解 `Local State` 里的 `encrypted_key`，成功拿到主密钥，但 `v20` 的数据不是这套算法加密的，解不开。这条路算是确认了"旧方法失效"。
+
+对真实的默认配置目录开 `--remote-debugging-port`，Chromium 156 起静默禁用，端口根本不监听。它只允许非默认的 user-data-dir。
+
+把整个 `User Data` 复制到临时目录，在副本上开调试端口。端口通了，`Storage.getCookies` 也能调，但只返回 30 个新生成的 msn/bing Cookie，原有的一条都没有。加密密钥绑定了配置路径，换了位置就解不开，浏览器干脆把它们全丢弃了。
+
+顺带说一句，`document.cookie` 也读不到，因为 `BDUSS` 和 `STOKEN` 都是 HttpOnly。
+
+结论就是只能人工复制。别再在这上面花时间了。
+
+## SAVE_DIR 是父目录，不是目标文件夹
+
+分享是单个文件夹时，实际落点等于 `SAVE_DIR` 加斜杠加分享文件夹名。
+
+填 `/示例文件夹` 会得到 `/示例文件夹/示例文件夹`。之后就算改回 `/`，那个嵌套目录也不会自己消失，得手动去网盘删掉。
+
+判断有没有踩这个坑：日志里出现「尝试整目录直接转存」并且成功，而你原本以为目标目录已经存在，那就是了。
+
+## 错误码对照
+
+`31062 文件名非法`：路径里有非法字符，或者路径被改写过，回去看第一节。
+
+`-65`：百度风控限频。停几个小时，别缩周期也别反复重试。
+
+未登录、登录态失效：Cookie 过期了，重新取 `BDUSS` 和 `STOKEN`。
+
+`创建目录失败: 文件名非法`：跟 31062 是同一回事。
+
+## Secret 只写不可读
+
+保存之后谁都看不到原值，包括你自己，只能覆盖。
+
+`SHARE_URLS` 这种多行内容尤其要注意，本地必须留一份原始清单。不然想加一条链接的时候，你已经不知道现在里面有哪些了。
+
+日志脱敏是子串级的，`SHARE_URLS` 里的片段也会被打码。日志里出现 `【1***1】` 这种奇怪的东西是正常的，不是程序出错。
+
+## 定时用的是 UTC
+
+cron 按 UTC 算，北京时间要减 8 小时。
+
+整点最容易堵，GitHub 的调度器在 `:00` 那会儿排队最长，可能延迟十几分钟。用 `:17`、`:43` 这种错开的分钟数会稳一些。
+
+频率别低于每 6 小时一次，密了容易触发 `-65`。
+
+## 同步上游会覆盖本地修改
+
+这个仓库是 Fork，master 上有三类本地提交：CI 修复、定时调整，以及曾经放过的技能目录（后来拆走了）。
+
+```bash
+gh repo sync --force   # 把 master 强制指向上游，本地提交全没
+gh repo sync           # 非强制，无法快进时会拒绝，不会覆盖
+```
+
+要长期保留本地改动，要么别用 force，要么同步前先建个备份分支。
+
+## 通知设置查不到，也改不了
+
+`GET /user/notification_settings` 这个端点不存在，返回 404。公开资料里的 `email` 字段常常是 `null`，说明用户隐藏了邮箱。想读私有邮箱列表需要 `user` scope，最小权限配置下通常没有。
+
+所以"还会不会收到邮件"只能去网页看：`Settings → Notifications → System → Actions`。
+
+有个间接的判断办法。GitHub 只在工作流失败时通知触发者，所以可以先看有没有失败的运行记录：
+
+```bash
+gh run list --repo owner/repo --limit 10 --json conclusion,createdAt
+```
+
+如果有 `failure`，就问用户那会儿有没有收到标题类似 `Run failed` 的邮件。没收到就说明通知确实关了，比翻设置页还直接。
+
+## 空仓库不能直接建 blob
+
+Git Data API 在没有任何提交的仓库上会报 409：
+
+```
+{"message":"Git Repository is empty."}
+```
+
+得先用 Contents API 落一个初始提交，之后 blob、tree、commit 那一套才能用：
+
+```bash
+gh api -X PUT repos/{o}/{r}/contents/README.md --input payload.json
+```
+
+## 一次删多个文件用 tree 就行
+
+在 `POST /git/trees` 里把条目的 `sha` 设成 `null`，一次提交就能删掉多个路径，不用逐个调 DELETE 产生一堆提交。
+
+```json
+{
+  "base_tree": "<当前 tree>",
+  "tree": [
+    {"path": "a/b.md", "mode": "100644", "type": "blob", "sha": null}
+  ]
+}
+```
